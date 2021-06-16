@@ -1,0 +1,256 @@
+import copy
+import random
+
+import time
+import numpy as np
+import torch
+from torch import nn
+
+from Utils.Helper import remote_method, get_accuracy, remote_method_async, load_model, DataAggregation, get_batch
+from Utils.Dataloader import partition_dataset
+
+from loguru import logger
+import wandb
+
+
+wandb_enable = True
+
+
+class ParameterServer(nn.Module):
+    def __init__(self, gpu, world_size, dataset, batch_size, lr, model, max_epoch, client_epoch, seed, exp_id):
+        super().__init__()
+
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.backends.cudnn.deterministic = True
+
+        self.iid = False
+
+        logger.add(f"logs/fed/{world_size}_{dataset}_{batch_size}_{lr}"
+                   f"_{model}_{max_epoch}_{client_epoch}_PS{exp_id}.log")
+        if wandb_enable:
+            wandb.init(project="Async_FedAvg",
+                       name=f"vanilla_{world_size}_{batch_size}_{max_epoch}_{client_epoch}"
+                            f"_{lr}_{dataset}_{model}_{'iid' if self.iid else 'noniid'}",
+                       config={
+                "method": "vanilla",
+                "world size": world_size,
+                "dataset": dataset,
+                "iid": self.iid,
+                "model": model,
+                "batch size": batch_size,
+                "learning rate": lr,
+                "momentum": 0.,
+                "lambda": 0.,
+                "global epoch": max_epoch,
+                "client epoch": client_epoch,
+                "seed": seed
+            })
+
+        self.max_epoch = max_epoch
+        self.client_epoch = client_epoch
+        self.curr_epoch = -1
+        self.lr = lr
+        self.world_size = world_size
+        self.device = f"cuda:{gpu}" if torch.cuda.is_available() else "cpu"
+        if dataset == "cifar100":
+            class_num = 100
+        elif dataset == "emnist":
+            class_num = 62
+        else:
+            class_num = 10
+        self.model = load_model(model, class_num).to(self.device)
+        self.model_name = model
+        self.aggregation = [DataAggregation(r) for r in range(1, world_size)]
+        self.embedding_list = []
+
+        self.client_counter = 0
+        self.fetch_time = 0.
+        self.sync_time = 0.
+
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.)
+        _, self.test_loader = partition_dataset(dataset, world_size - 1, 0, batch_size, seed, self.iid)
+
+    def embedding_workers(self, _rref):
+        print(f"Param Server add a worker reference")
+        self.embedding_list.append(_rref)
+
+    def worker_weight_update(self, rank, weight):
+        item = next((x for x in self.aggregation if x.rank == rank), None)
+        if item is None:
+            raise Exception("PS trys to update the weight of a worker that doesn't exists")
+        item.weight = copy.deepcopy(weight)
+        print(f"PS updating worker {rank}'s aggregation weight to {weight}")
+
+    def forward(self, x):
+        x = x.to(self.device)
+        out = self.model(x)
+        return out
+
+    def instruct_training(self):
+        total_train_time = 0.
+        acc_list = []
+
+        if wandb_enable:
+            wandb.watch(self.model)
+
+        for curr_epoch in range(self.max_epoch):
+            logger.info(f"PS instructs training for epoch {curr_epoch}")
+            epoch_time = []
+            futs = []
+            for worker_rref in self.embedding_list:
+                fut = remote_method_async(TrainerNet.train_locally, worker_rref)
+                futs.append(fut)
+            for fut in futs:
+                train_time, comm_time = fut.wait()
+                epoch_time.append(train_time + comm_time)
+            total_train_time += max(epoch_time)
+            logger.info(f"Cluster finished training for epoch {curr_epoch}, max epoch {self.max_epoch - 1}")
+            logger.info(f"Epoch {curr_epoch} takes {max(epoch_time)} seconds")
+
+            acc = get_accuracy(self.test_loader, self.model, self.device, self.model_name == "transformer")
+            logger.info(f"Accuracy: {acc}")
+            acc_list.append(acc)
+            if wandb_enable:
+                wandb.log({"accuracy": acc}, step=curr_epoch)
+                wandb.log({"training time": max(epoch_time), "total train time": total_train_time}, step=curr_epoch)
+
+        logger.info("Training complete!")
+        acc = get_accuracy(self.test_loader, self.model, self.device, self.model_name == "transformer")
+        acc_list.append(acc)
+        logger.info(f"Total train time: {total_train_time}")
+        logger.info(f"Best accuracy {max(acc_list)}")
+        if wandb_enable:
+            wandb.log({"accuracy": acc}, step=self.max_epoch - 1)
+            wandb.finish()
+
+    def distribute_state(self, k):
+        for name, param in self.model.named_parameters():
+            if name == k:
+                return param.data.to("cpu")
+
+    def synchronize(self, rank, key, data):
+        item = next((x for x in self.aggregation if x.rank == rank), None)
+        if item is None:
+            raise Exception("PS trys to update the data of a worker that doesn't exists")
+        item.data[key] = copy.deepcopy(data.to(self.device))
+
+    def sync_counter(self):
+        self.client_counter += 1
+        total_weights = sum([item.weight for item in self.aggregation])
+        workers_weight = [item.weight / total_weights for item in self.aggregation]
+        if self.client_counter == self.world_size - 1:
+            self.model.train()
+            for name, param in self.model.named_parameters():
+                temp_data = torch.zeros(self.aggregation[0].data[name].shape).to(self.device)
+                for index in range(0, self.world_size - 1):
+                    temp_data += self.aggregation[index].data[name] * workers_weight[index]
+                param.data = copy.deepcopy(temp_data).to(self.device)
+            for aggregation_item in self.aggregation:
+                aggregation_item.clear_data()
+            self.client_counter = 0
+
+
+class TrainerNet(nn.Module):
+    def __init__(self, gpu, rank, world_size, dataset, model,
+                 batch_size, lr, client_epoch, seed, exp_id):
+        super().__init__()
+
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        np.random.seed(seed)
+        random.seed(seed)
+        torch.backends.cudnn.deterministic = True
+
+        self.iid = False
+
+        logger.add(f"logs/fed/{world_size}_{dataset}_{batch_size}_{lr}"
+                   f"_{exp_id}_{rank}.log")
+        self.rank = rank
+        self.lr = lr
+        self.client_epoch = client_epoch
+        self.device = f"cuda:{gpu}" if torch.cuda.is_available() else "cpu"
+        if dataset == "cifar100":
+            class_num = 100
+        elif dataset == "emnist":
+            class_num = 62
+        else:
+            class_num = 10
+        self.model_name = model
+        self.model = load_model(model, class_num).to(self.device)
+        self.optimizer = torch.optim.SGD(self.model.parameters(), lr=self.lr, momentum=0.)
+        if model == "transformer":
+            self.loss_func = nn.NLLLoss()
+        else:
+            self.loss_func = nn.CrossEntropyLoss()
+        self.train_loader, _ = partition_dataset(dataset, world_size - 1, rank - 1, batch_size, seed, self.iid)
+
+    def embedding_param_server(self, _rref):
+        self.param_server_rref = _rref
+        if self.model_name == "transformer":
+            remote_method(ParameterServer.worker_weight_update, self.param_server_rref, self.rank,
+                          len(self.train_loader))
+        else:
+            remote_method(ParameterServer.worker_weight_update, self.param_server_rref, self.rank,
+                          len(self.train_loader.dataset))
+
+    def forward(self, x):
+        x = x.to(self.device)
+        return self.model(x)
+
+    def train_locally(self):
+        self.model.train()
+        fetch_time = self.fetch_state()
+        global_train_time = 0.
+        for e in range(self.client_epoch):
+            self.model.train()
+            total_loss = 0.
+            train_start = time.time()
+            if self.model_name == "transformer":
+                bptt = 35
+                ntokens = 33278
+                for batch, i in enumerate(range(0, self.train_loader.size(0) - 1, bptt)):
+                    data, target = get_batch(self.train_loader, i, bptt)
+                    data = data.to(self.device)
+                    target = target.to(self.device)
+                    self.model.zero_grad()
+                    pred = self.model(data)
+                    loss = self.loss_func(pred.view(-1, ntokens), target)
+                    total_loss += loss.item()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), 0.25)
+                    self.optimizer.step()
+            else:
+                for i, (data, target) in enumerate(self.train_loader):
+                    data, target = data.to(self.device), target.to(self.device)
+                    self.model.zero_grad()
+                    pred = self.model(data)
+                    loss = self.loss_func(pred, target)
+                    total_loss += loss.item()
+                    loss.backward()
+                    self.optimizer.step()
+            train_end = time.time()
+            global_train_time += train_end - train_start
+            logger.info(f"Rank {self.rank} training time: {train_end - train_start}")
+            logger.info(f"Rank {self.rank} training loss: {total_loss / len(self.train_loader)}")
+        sync_time = self.synchronize()
+        logger.info(f"Rank {self.rank} communication time: {sync_time + fetch_time}")
+        return global_train_time, sync_time + fetch_time
+
+    def fetch_state(self):
+        fetch_time = 0.
+        for name, param in self.model.named_parameters():
+            param.data = copy.deepcopy(remote_method(
+                ParameterServer.distribute_state, self.param_server_rref, name)).to(self.device)
+        return fetch_time
+
+    def synchronize(self):
+        sync_time = 0.
+        for name, param in self.model.named_parameters():
+            remote_method(ParameterServer.synchronize, self.param_server_rref, self.rank,
+                          name, copy.deepcopy(param.data).to("cpu"))
+        remote_method(ParameterServer.sync_counter, self.param_server_rref)
+        return sync_time
+
