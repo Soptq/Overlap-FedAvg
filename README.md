@@ -1,3 +1,4 @@
+[![DOI](https://zenodo.org/badge/320731198.svg)](https://zenodo.org/badge/latestdoi/320731198)
 # Overlap-FedAvg
 Official Pytorch implementation of "Communication-Efficient Federated Learning with Compensated Overlap-FedAvg"
 
